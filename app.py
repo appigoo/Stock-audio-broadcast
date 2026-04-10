@@ -149,35 +149,115 @@ def calc_change(current, prev):
         return ((current - prev) / abs(prev)) * 100
     return 0.0
 
+def num_to_zh(n: float, decimals=2) -> str:
+    """Format a float naturally for Chinese TTS — avoids symbols."""
+    integer = int(n)
+    frac = round(n - integer, decimals)
+    zh_digits = "零一二三四五六七八九"
+    def _int_zh(x):
+        return str(x)  # TTS reads digits fine; avoid comma separators
+    s = _int_zh(integer)
+    if decimals > 0 and frac > 0:
+        frac_str = f"{frac:.{decimals}f}"[2:]  # digits after decimal
+        s += "點" + "".join(frac_str)
+    return s
+
+def vol_to_zh(v: int) -> str:
+    """Convert volume to spoken Chinese: 萬 / 億."""
+    if v >= 100_000_000:
+        return f"{v/100_000_000:.1f}億"
+    elif v >= 10_000:
+        return f"{v/10_000:.0f}萬"
+    else:
+        return str(v)
+
 def build_tts_text(ticker, price, price_pct, volume, vol_pct, lang="zh-TW"):
     name = STOCK_NAMES.get(ticker, ticker)
-    direction_p = "上升" if price_pct >= 0 else "下跌"
-    direction_v = "上升" if vol_pct  >= 0 else "下跌"
+    direction_p = "上漲" if price_pct >= 0 else "下跌"
+    direction_v = "增加" if vol_pct  >= 0 else "減少"
     abs_pp = abs(price_pct)
     abs_vp = abs(vol_pct)
-    if lang == "zh-TW":
-        return (f"{name}，股價 {price:.2f} 美元，"
-                f"{direction_p} {abs_pp:.2f} 百分比，"
-                f"成交量 {int(volume):,}，"
-                f"{direction_v} {abs_vp:.2f} 百分比。")
+
+    if lang in ("zh-TW", "zh-CN"):
+        price_str = num_to_zh(price, 2)
+        pp_str    = num_to_zh(abs_pp, 2)
+        vp_str    = num_to_zh(abs_vp, 2)
+        vol_str   = vol_to_zh(int(volume))
+        return (
+            f"{name}。"
+            f"現價{price_str}美元，{direction_p}百分之{pp_str}。"
+            f"成交量{vol_str}，{direction_v}百分之{vp_str}。"
+        )
     else:
-        return (f"{name}, price {price:.2f} dollars, "
-                f"{'up' if price_pct>=0 else 'down'} {abs_pp:.2f} percent, "
-                f"volume {int(volume):,}, "
-                f"{'up' if vol_pct>=0 else 'down'} {abs_vp:.2f} percent.")
+        p_word = "up" if price_pct >= 0 else "down"
+        v_word = "up" if vol_pct   >= 0 else "down"
+        return (
+            f"{name}. "
+            f"Price {price:.2f} dollars, {p_word} {abs_pp:.2f} percent. "
+            f"Volume {int(volume):,}, {v_word} {abs_vp:.2f} percent."
+        )
 
 def tts_js(text: str, lang: str = "zh-TW", rate: float = 0.95) -> str:
-    escaped = text.replace("'", "\\'").replace('"', '\\"')
+    escaped = text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+    # Priority voice keywords per language — picks the best neural/natural voice available
+    voice_priority = {
+        "zh-TW": ["HsiaoChen", "HsiaoYu", "Yating", "zh-TW"],
+        "zh-CN": ["XiaoxiaoNeural", "Xiaoxiao", "Yunyang", "zh-CN"],
+        "en-US": ["Aria", "Jenny", "Samantha", "en-US"],
+    }
+    priorities = voice_priority.get(lang, [lang])
+    priorities_js = str(priorities).replace("'", '"')
+
     return f"""
 <script>
 (function() {{
     if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
-    var u = new SpeechSynthesisUtterance('{escaped}');
-    u.lang = '{lang}';
-    u.rate = {rate};
-    u.pitch = 1;
-    window.speechSynthesis.speak(u);
+
+    var text = '{escaped}';
+    var lang = '{lang}';
+    var rate = {rate};
+    var priorities = {priorities_js};
+
+    function pickVoice(voices) {{
+        // Try each priority keyword in order
+        for (var p of priorities) {{
+            var found = voices.find(v =>
+                v.lang.startsWith(lang.split('-')[0]) &&
+                (v.name.includes(p) || v.lang === p)
+            );
+            if (found) return found;
+        }}
+        // Fallback: any voice matching language
+        return voices.find(v => v.lang.startsWith(lang.split('-')[0])) || null;
+    }}
+
+    function speak(voice) {{
+        var u = new SpeechSynthesisUtterance(text);
+        u.lang = lang;
+        u.rate = rate;
+        u.pitch = 1.0;
+        u.volume = 1.0;
+        if (voice) u.voice = voice;
+        window.speechSynthesis.speak(u);
+    }}
+
+    var voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {{
+        speak(pickVoice(voices));
+    }} else {{
+        // Voices not loaded yet — wait for the event
+        window.speechSynthesis.onvoiceschanged = function() {{
+            voices = window.speechSynthesis.getVoices();
+            speak(pickVoice(voices));
+        }};
+        // Failsafe: trigger after 300ms anyway
+        setTimeout(function() {{
+            if (!window.speechSynthesis.speaking) {{
+                speak(null);
+            }}
+        }}, 300);
+    }}
 }})();
 </script>
 """
@@ -218,6 +298,36 @@ with st.sidebar:
 
     st.markdown("---")
     auto_voice = st.toggle("🔊 自動語音播報", value=True)
+
+    with st.expander("🎙 語音診斷 / 測試"):
+        st.markdown("""
+<div id='voice-list' style='font-size:0.75rem; color:#4a6080; max-height:120px; overflow-y:auto;'>
+  載入語音列表中...
+</div>
+<script>
+function listVoices() {
+    var v = window.speechSynthesis.getVoices();
+    var el = document.getElementById('voice-list');
+    if (!el) return;
+    if (v.length === 0) { setTimeout(listVoices, 200); return; }
+    var zh = v.filter(x => x.lang.startsWith('zh') || x.lang.startsWith('en'));
+    el.innerHTML = zh.map(x =>
+        '<div style="padding:2px 0; border-bottom:1px solid #1e2d45;">' +
+        x.name + ' <span style="color:#00d4ff">' + x.lang + '</span>' +
+        (x.localService ? ' ✓local' : '') + '</div>'
+    ).join('') || '<div>找不到中文語音，請確認系統已安裝中文TTS</div>';
+}
+window.speechSynthesis.onvoiceschanged = listVoices;
+listVoices();
+</script>
+""", unsafe_allow_html=True)
+        if st.button("🔈 測試語音"):
+            test_text = {"zh-TW": "測試，特斯拉，現價三百美元，上漲百分之一點五。",
+                         "zh-CN": "测试，特斯拉，现价三百美元，上涨百分之一点五。",
+                         "en-US": "Test. Tesla. Price three hundred dollars, up one point five percent."
+                         }.get(lang, "Test.")
+            st.components.v1.html(tts_js(test_text, lang, voice_rate), height=0)
+
     st.markdown("---")
 
     col1, col2 = st.columns(2)

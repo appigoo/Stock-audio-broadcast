@@ -116,6 +116,17 @@ html, body, .stApp { background: var(--bg) !important; color: var(--text) !impor
 
 /* Divider */
 hr { border-color: var(--border) !important; }
+
+/* Trend badge */
+.trend-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 14px; border-radius: 20px;
+    font-size: 0.85rem; font-weight: 700; letter-spacing: 0.5px;
+    margin: 10px 0 4px; width: 100%; justify-content: center;
+}
+.trend-up   { background: rgba(0,255,136,0.12); border: 1px solid #00ff88; color: #00ff88; }
+.trend-down { background: rgba(255,51,102,0.12); border: 1px solid #ff3366; color: #ff3366; }
+.trend-flat { background: rgba(74,96,128,0.2);   border: 1px solid #4a6080; color: #8aa0b8; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -149,6 +160,60 @@ def calc_change(current, prev):
         return ((current - prev) / abs(prev)) * 100
     return 0.0
 
+def calc_trend(df: pd.DataFrame):
+    """
+    Returns a trend dict:
+      trend_label : "強勢上升" / "上升" / "橫盤" / "下跌" / "強勢下跌"
+      trend_en    : "strong uptrend" / "uptrend" / "sideways" / "downtrend" / "strong downtrend"
+      streak      : int  (consecutive up/down candles, positive=up, negative=down)
+      ma5_slope   : float  (% change of 5-bar MA over last 5 bars)
+      ma5_above   : bool  (price > MA5?)
+      emoji       : str
+    """
+    close = df["Close"].squeeze().dropna()
+    n = len(close)
+
+    # ── Consecutive streak ────────────────────────────────────────────────────
+    streak = 0
+    for i in range(n - 1, 0, -1):
+        diff = float(close.iloc[i]) - float(close.iloc[i - 1])
+        if streak == 0:
+            streak = 1 if diff > 0 else -1
+        elif streak > 0 and diff > 0:
+            streak += 1
+        elif streak < 0 and diff < 0:
+            streak -= 1
+        else:
+            break
+
+    # ── MA5 slope (% change over last min(5,n) bars) ──────────────────────────
+    window = min(5, n)
+    ma5 = close.rolling(window).mean().dropna()
+    if len(ma5) >= 2:
+        ma5_slope = calc_change(float(ma5.iloc[-1]), float(ma5.iloc[-window]))
+    else:
+        ma5_slope = 0.0
+
+    price_now = float(close.iloc[-1])
+    ma5_above = price_now > float(ma5.iloc[-1]) if len(ma5) > 0 else True
+
+    # ── Classify ──────────────────────────────────────────────────────────────
+    if ma5_slope > 1.0 and streak >= 3:
+        label, label_en, emoji = "強勢上升", "strong uptrend", "🚀"
+    elif ma5_slope > 0.2 or streak >= 2:
+        label, label_en, emoji = "上升趨勢", "uptrend", "📈"
+    elif ma5_slope < -1.0 and streak <= -3:
+        label, label_en, emoji = "強勢下跌", "strong downtrend", "🔻"
+    elif ma5_slope < -0.2 or streak <= -2:
+        label, label_en, emoji = "下跌趨勢", "downtrend", "📉"
+    else:
+        label, label_en, emoji = "橫盤整理", "sideways", "➡️"
+
+    return {
+        "label": label, "label_en": label_en, "emoji": emoji,
+        "streak": streak, "ma5_slope": ma5_slope, "ma5_above": ma5_above,
+    }
+
 def num_to_zh(n: float, decimals=2) -> str:
     """Format a float naturally for Chinese TTS — avoids symbols."""
     integer = int(n)
@@ -171,28 +236,32 @@ def vol_to_zh(v: int) -> str:
     else:
         return str(v)
 
-def build_tts_text(ticker, price, price_pct, volume, vol_pct, lang="zh-TW"):
+def build_tts_text(ticker, price, price_pct, volume, vol_pct, trend: dict, lang="zh-TW"):
     name = STOCK_NAMES.get(ticker, ticker)
     direction_p = "上漲" if price_pct >= 0 else "下跌"
     direction_v = "增加" if vol_pct  >= 0 else "減少"
     abs_pp = abs(price_pct)
     abs_vp = abs(vol_pct)
+    streak_abs = abs(trend["streak"])
 
     if lang in ("zh-TW", "zh-CN"):
         price_str = num_to_zh(price, 2)
         pp_str    = num_to_zh(abs_pp, 2)
         vp_str    = num_to_zh(abs_vp, 2)
         vol_str   = vol_to_zh(int(volume))
+        streak_str = f"，已連續{streak_abs}根K線{'上漲' if trend['streak']>0 else '下跌'}" if streak_abs >= 2 else ""
         return (
             f"{name}。"
+            f"目前處於{trend['label']}{streak_str}。"
             f"現價{price_str}美元，{direction_p}百分之{pp_str}。"
             f"成交量{vol_str}，{direction_v}百分之{vp_str}。"
         )
     else:
         p_word = "up" if price_pct >= 0 else "down"
         v_word = "up" if vol_pct   >= 0 else "down"
+        streak_str = f" {streak_abs} consecutive {'up' if trend['streak']>0 else 'down'} candles." if streak_abs >= 2 else ""
         return (
-            f"{name}. "
+            f"{name}. {trend['label_en']}.{streak_str} "
             f"Price {price:.2f} dollars, {p_word} {abs_pp:.2f} percent. "
             f"Volume {int(volume):,}, {v_word} {abs_vp:.2f} percent."
         )
@@ -290,7 +359,7 @@ with st.sidebar:
 
     st.markdown("---")
     interval = st.selectbox("⏱ K線週期", ["1m","5m","15m","30m"], index=1)
-    refresh_sec = st.selectbox("🔄 自動更新間隔", [30, 60, 120, 180, 300],
+    refresh_sec = st.selectbox("🔄 自動更新間隔", [30, 60, 300],
                                 format_func=lambda x: f"{x} 秒")
     lang = st.selectbox("🗣 語音語言", ["zh-TW", "zh-CN", "en-US"],
                          format_func=lambda x: {"zh-TW":"繁體中文","zh-CN":"普通話","en-US":"English"}[x])
@@ -400,23 +469,41 @@ for i in range(0, len(selected_tickers), cols_per_row):
             prev_vol   = float(prev["Volume"])
             vol_pct    = calc_change(volume, prev_vol)
 
+            trend = calc_trend(df)
+
             pc   = css_cls(price_pct)
             vc   = css_cls(vol_pct)
+            # trend badge class
+            if "上升" in trend["label"] or "uptrend" in trend["label_en"]:
+                tc = "trend-up"
+            elif "下跌" in trend["label"] or "downtrend" in trend["label_en"]:
+                tc = "trend-down"
+            else:
+                tc = "trend-flat"
+
+            streak_abs = abs(trend["streak"])
+            streak_txt = f"  連{streak_abs}根{'↑' if trend['streak']>0 else '↓'}" if streak_abs >= 2 else ""
+            ma_txt = f"MA5 {'↑' if trend['ma5_slope']>=0 else '↓'} {abs(trend['ma5_slope']):.2f}%"
+
             ts   = df.index[-1].strftime("%H:%M:%S") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
             name = STOCK_NAMES.get(ticker, ticker)
 
-            # ── Mini sparkline ──
+            # ── Mini sparkline with MA5 ──
             fig = go.Figure()
             close_series = df["Close"].squeeze()
+            ma5_series   = close_series.rolling(min(5, len(close_series))).mean()
             fig.add_trace(go.Scatter(
                 x=df.index, y=close_series,
                 mode="lines",
-                line=dict(
-                    color="#00ff88" if price_pct >= 0 else "#ff3366",
-                    width=1.5,
-                ),
+                line=dict(color="#00ff88" if price_pct >= 0 else "#ff3366", width=1.5),
                 fill="tozeroy",
                 fillcolor="rgba(0,255,136,0.05)" if price_pct >= 0 else "rgba(255,51,102,0.05)",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index, y=ma5_series,
+                mode="lines",
+                line=dict(color="#00d4ff", width=1, dash="dot"),
+                name="MA5",
             ))
             fig.update_layout(
                 height=80, margin=dict(l=0,r=0,t=0,b=0),
@@ -428,11 +515,12 @@ for i in range(0, len(selected_tickers), cols_per_row):
             # ── Card ──
             st.markdown(f"""
             <div class='metric-card'>
-              <div class='ticker-header' style='padding:0; border:none; margin-bottom:10px;'>
+              <div class='ticker-header' style='padding:0; border:none; margin-bottom:6px;'>
                 <div class='ticker-name' style='font-size:1.8rem;'>{ticker}</div>
                 <div class='ticker-time'>{name} · {ts}</div>
               </div>
-              <div class='metric-label'>現價 (USD)</div>
+              <div class='trend-badge {tc}'>{trend["emoji"]} {trend["label"]}{streak_txt} &nbsp;·&nbsp; {ma_txt}</div>
+              <div class='metric-label' style='margin-top:10px;'>現價 (USD)</div>
               <div class='metric-value {pc}'>${price:,.2f}</div>
               <div class='metric-change {pc}'>{arrow(price_pct)} {abs(price_pct):.2f}%</div>
               <hr style='margin:12px 0; opacity:0.2'>
@@ -445,7 +533,7 @@ for i in range(0, len(selected_tickers), cols_per_row):
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
             # Collect speech
-            speech = build_tts_text(ticker, price, price_pct, volume, vol_pct, lang)
+            speech = build_tts_text(ticker, price, price_pct, volume, vol_pct, trend, lang)
             all_speech_parts.append(speech)
 
 # ── Status bar ────────────────────────────────────────────────────────────────

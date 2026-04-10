@@ -290,7 +290,7 @@ with st.sidebar:
 
     st.markdown("---")
     interval = st.selectbox("⏱ K線週期", ["1m","5m","15m","30m"], index=1)
-    refresh_sec = st.selectbox("🔄 自動更新間隔", [30, 60, 300],
+    refresh_sec = st.selectbox("🔄 自動更新間隔", [30, 60, 120, 180, 300],
                                 format_func=lambda x: f"{x} 秒")
     lang = st.selectbox("🗣 語音語言", ["zh-TW", "zh-CN", "en-US"],
                          format_func=lambda x: {"zh-TW":"繁體中文","zh-CN":"普通話","en-US":"English"}[x])
